@@ -631,9 +631,9 @@ task.spawn(function()
             end
             if onTitan then
                 pcall(keypress,   0x20)
-                task.wait(0.01)
+                task.wait(0.03)
                 pcall(keyrelease, 0x20)
-                task.wait(0.01)
+                task.wait(0.03)
             else
                 task.wait(0.15)
             end
