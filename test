@@ -71,7 +71,7 @@ local refillCooldownUntil = 0
 local lastKillAt = tick()
 
 local HitboxSize    = 200
-local KillCooldown  = 0.35
+local KillCooldown  = 0.10
 local RefreshRate   = 0.2
 local OriginalSizes = {}
 
@@ -2072,7 +2072,7 @@ local function PageTuning(zb, cardX, cardW)
         "Studs above the nape Auto Kill TPs you each cycle.\n" ..
         "Higher = bigger fall, more slam speed, more risk\n" ..
         "of overshoot. Lower = safer, weaker hit.\n" ..
-        "Default: 90")
+        "Default: 80")
     local n2 = Drawing.new("Text")
     n2.Position = Vector2.new(rsliderX, cur); n2.Text = "Default: 80"
     n2.Color = Colors.TextMuted; n2.Size = 11
