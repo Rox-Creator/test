@@ -31,7 +31,7 @@ local Offsets     = HttpService:JSONDecode(OffsetsJSON)
 
 -- Auto Kill slam pattern (matches the Tuning sliders from AOTR.lua)
 local HitboxSize    = 150     -- nape hitbox cube size (studs)
-local DropHeight    = 80      -- studs above nape we snap each cycle
+local DropHeight    = 82      -- studs above nape we snap each cycle
 local DropDwell     = 0.15    -- max free-fall seconds before TP'ing back up
 local FloorBuffer   = 60      -- exit dwell once player crosses nape.Y + this
 local AnchorEvery   = 8       -- cycles between INSTANT velocity resets
@@ -40,12 +40,6 @@ local KillCooldown  = 0.10    -- seconds between slashes
 -- Boot delay — same 8s warmup AOTR.lua uses, so the player isn't TPed
 -- onto a titan before they've finished loading the map.
 local ReadyDelay    = 8
-
--- Auto Booster
-local BoostXZRadius = 25      -- studs of XZ slack from nape position
-local BoostMinY     = 2       -- player must be at least this many studs above nape
-local BoostMaxY     = 120     -- ...and no more than this far above
-local BoostTapGap   = 0.10    -- seconds between Space taps
 
 -- Auto Refill
 local RefillRange       = 5     -- XZ studs — must be this close to count as on-tank
@@ -59,7 +53,7 @@ local SafeSpotHeight    = 400   -- post-refill up-throw height
 local SafeSpotDwell     = 2.5   -- seconds of free-fall before AutoKill resumes
 
 -- Watchdogs
-local BladeStuckTimeout = 80    -- seconds — taps R if no blade decrement this long
+local BladeStuckTimeout = 15    -- seconds — taps R if no blade decrement this long
 local StuckMissionAfter = 180   -- seconds — force retry if no kill in this long
 
 -- The HUD reads "0" when 3 of the player's 4 blade SETS have been
@@ -598,44 +592,51 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- AUTO BOOSTER — tap Space while above a live titan to chain dashes.
+-- AUTO BOOSTER — spam Space while standing above a live titan's
+-- nape. Skipped during refill so we don't space ourselves off the
+-- gas tank.
 -- ============================================================
 task.spawn(function()
     while tick() - SCRIPT_LOAD_AT < ReadyDelay do task.wait(0.5) end
     while Running do
-        local hrp = getHRP()
-        local titansFolder = Workspace:FindFirstChild("Titans")
-        local onTitan = false
-        if hrp and titansFolder then
-            local okPP, pPos = pcall(function() return hrp.Position end)
-            if okPP and pPos then
-                for _, titan in ipairs(titansFolder:GetChildren()) do
-                    if findHumanoid(titan) then
-                        local nape = getNape(titan)
-                        if nape then
-                            local okN, npos = pcall(function() return nape.Position end)
-                            if okN and npos then
-                                local dx = pPos.X - npos.X
-                                local dz = pPos.Z - npos.Z
-                                local dy = pPos.Y - npos.Y
-                                if dx*dx + dz*dz <= BoostXZRadius * BoostXZRadius
-                                   and dy >= BoostMinY and dy <= BoostMaxY then
-                                    onTitan = true
-                                    break
+        if RefillingNow then
+            task.wait(0.2)
+        else
+            local onTitan = false
+            local hrp = getHRP()
+            local titansFolder = Workspace:FindFirstChild("Titans")
+            if hrp and titansFolder then
+                local okPP, pPos = pcall(function() return hrp.Position end)
+                if okPP and pPos then
+                    for _, titan in ipairs(titansFolder:GetChildren()) do
+                        if findHumanoid(titan) then
+                            local nape = getNape(titan)
+                            if nape then
+                                local okN, npos = pcall(function() return nape.Position end)
+                                if okN and npos then
+                                    local dx = pPos.X - npos.X
+                                    local dz = pPos.Z - npos.Z
+                                    local dy = pPos.Y - npos.Y
+                                    -- Within 25 studs XZ and 0-150 above the nape.
+                                    if dx*dx + dz*dz <= 625
+                                       and dy >= 0 and dy <= 150 then
+                                        onTitan = true
+                                        break
+                                    end
                                 end
                             end
                         end
                     end
                 end
             end
-        end
-        if onTitan then
-            pcall(keypress,   0x20)
-            task.wait(0.04)
-            pcall(keyrelease, 0x20)
-            task.wait(BoostTapGap)
-        else
-            task.wait(0.15)
+            if onTitan then
+                pcall(keypress,   0x20)
+                task.wait(0.01)
+                pcall(keyrelease, 0x20)
+                task.wait(0.01)
+            else
+                task.wait(0.15)
+            end
         end
     end
 end)
