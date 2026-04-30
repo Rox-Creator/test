@@ -62,6 +62,12 @@ local SafeSpotDwell     = 2.5   -- seconds of free-fall before AutoKill resumes
 local BladeStuckTimeout = 80    -- seconds — taps R if no blade decrement this long
 local StuckMissionAfter = 180   -- seconds — force retry if no kill in this long
 
+-- The HUD reads "0" when 3 of the player's 4 blade SETS have been
+-- spent, but the 4th set is still equipped and usable. Wait this
+-- long after blades first read 0 before triggering refill, so the
+-- last set actually gets used first.
+local BladesZeroDelay = 8
+
 -- Re-injection path. Set this to wherever you save THIS file. After
 -- a sub-place retry, queue_on_teleport reloads from disk so the
 -- script keeps running on the new map.
@@ -436,10 +442,22 @@ end)
 -- ============================================================
 task.spawn(function()
     while tick() - SCRIPT_LOAD_AT < ReadyDelay do task.wait(0.5) end
+    local zeroBladesAt = nil   -- tick() when sets first read 0
     while Running do
         if not RefillingNow and tick() >= refillCooldownUntil then
             local sets = getBladeSets()
             if sets == 0 then
+                -- Hold off until blades have been 0 for BladesZeroDelay
+                -- seconds — the HUD reads 0 once the 3 spare sets are
+                -- spent, but the equipped 4th set still has blades.
+                if not zeroBladesAt then zeroBladesAt = tick() end
+            else
+                zeroBladesAt = nil
+            end
+
+            if sets == 0 and zeroBladesAt
+               and tick() - zeroBladesAt >= BladesZeroDelay then
+                zeroBladesAt = nil
                 local refill = getNearestRefill()
                 if refill then
                     RefillingNow = true
@@ -457,76 +475,83 @@ task.spawn(function()
                             pcall(function() h.Velocity = Vector3.zero end)
                         end
 
-                        local anchorEnd = tick() + RefillAnchorTime
-                        while tick() < anchorEnd do
+                        local function isOnTank()
+                            local h = getHRP()
+                            if not h then return false end
+                            local okPP, pPos = pcall(function() return h.Position end)
+                            if not (okPP and pPos) then return false end
+                            local dx = pPos.X - rPos.X
+                            local dz = pPos.Z - rPos.Z
+                            return dx*dx + dz*dz <= RefillRange * RefillRange
+                        end
+
+                        -- Brief initial settle so the first TP has a
+                        -- moment to register before we start polling.
+                        for _ = 1, 3 do
                             anchor()
                             task.wait(RefillAnchorGap)
                         end
 
-                        -- XZ-only verify (Y always sits at +RefillHeight by design)
-                        local h = getHRP()
-                        local onTank = false
-                        if h then
-                            local okPP, pPos = pcall(function() return h.Position end)
-                            if okPP and pPos then
-                                local dx = pPos.X - rPos.X
-                                local dz = pPos.Z - rPos.Z
-                                if dx*dx + dz*dz <= RefillRange * RefillRange then
-                                    onTank = true
-                                end
-                            end
-                        end
-
+                        -- Combined re-anchor + R-spam + success poll.
+                        -- Each tick: if we've drifted off the tank
+                        -- (Auto Booster's space-spam, titan nudges,
+                        -- ragdoll), re-anchor and HOLD R RELEASED.
+                        -- Only fire R when we're actually within
+                        -- RefillRange XZ of the tank — otherwise R
+                        -- presses go to wherever we are and accomplish
+                        -- nothing.
                         local refillSucceeded = false
-                        if onTank then
-                            local spamEnd   = tick() + RefillRSpamTime
-                            local pollUntil = tick() + RefillRSpamTime + RefillPollTail
-                            local rDown     = false
-                            while tick() < pollUntil do
-                                if tick() < spamEnd then
-                                    if rDown then
-                                        pcall(keyrelease, 0x52)
-                                        rDown = false
-                                    else
-                                        pcall(keypress, 0x52)
-                                        rDown = true
-                                    end
-                                elseif rDown then
+                        local spamEnd   = tick() + RefillRSpamTime
+                        local pollUntil = tick() + RefillRSpamTime + RefillPollTail
+                        local rDown     = false
+
+                        while tick() < pollUntil do
+                            if not isOnTank() then
+                                anchor()
+                                if rDown then
                                     pcall(keyrelease, 0x52)
                                     rDown = false
                                 end
-
-                                local afterAttrs = snapshotPlayerNumericAttrs()
-                                for k, v in pairs(beforeAttrs) do
-                                    local a = afterAttrs[k]
-                                    if a and a < v then
-                                        refillSucceeded = true
-                                        break
-                                    end
+                            elseif tick() < spamEnd then
+                                if rDown then
+                                    pcall(keyrelease, 0x52)
+                                    rDown = false
+                                else
+                                    pcall(keypress, 0x52)
+                                    rDown = true
                                 end
-                                if refillSucceeded then break end
-                                task.wait(RefillPollStep)
+                            elseif rDown then
+                                pcall(keyrelease, 0x52)
+                                rDown = false
                             end
-                            if rDown then pcall(keyrelease, 0x52) end
 
-                            if refillSucceeded then
-                                local h2 = getHRP()
-                                if h2 then
-                                    local okPP, pPos = pcall(function() return h2.Position end)
-                                    if okPP and pPos then
-                                        pcall(function()
-                                            h2.CFrame = CFrame.new(pPos.X,
-                                                pPos.Y + SafeSpotHeight, pPos.Z)
-                                        end)
-                                        pcall(function() h2.AssemblyLinearVelocity = Vector3.zero end)
-                                        pcall(function() h2.Velocity = Vector3.zero end)
-                                        task.wait(SafeSpotDwell)
-                                    end
+                            local afterAttrs = snapshotPlayerNumericAttrs()
+                            for k, v in pairs(beforeAttrs) do
+                                local a = afterAttrs[k]
+                                if a and a < v then
+                                    refillSucceeded = true
+                                    break
                                 end
                             end
+                            if refillSucceeded then break end
+                            task.wait(RefillPollStep)
                         end
+                        if rDown then pcall(keyrelease, 0x52) end
 
                         if refillSucceeded then
+                            local h2 = getHRP()
+                            if h2 then
+                                local okPP, pPos = pcall(function() return h2.Position end)
+                                if okPP and pPos then
+                                    pcall(function()
+                                        h2.CFrame = CFrame.new(pPos.X,
+                                            pPos.Y + SafeSpotHeight, pPos.Z)
+                                    end)
+                                    pcall(function() h2.AssemblyLinearVelocity = Vector3.zero end)
+                                    pcall(function() h2.Velocity = Vector3.zero end)
+                                    task.wait(SafeSpotDwell)
+                                end
+                            end
                             refillFailures = 0
                             refillCooldownUntil = 0
                         else
