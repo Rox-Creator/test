@@ -4,9 +4,23 @@
 -- Hotkey: End to unload.
 
 local Players     = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
 local Workspace   = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
+
+-- Autoexec fires before the player joins, so Players.LocalPlayer is
+-- nil for the first 1-3 seconds. Block the script here until it
+-- exists, otherwise every helper that does `LocalPlayer:FindFirstChild`
+-- crashes with "attempt to index nil".
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait(0.2)
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- Same for PlayerGui — exists shortly after LocalPlayer.
+while not LocalPlayer:FindFirstChild("PlayerGui") do
+    task.wait(0.2)
+end
 
 local OffsetsJSON = game:HttpGet("https://offsets.ntgetwritewatch.workers.dev/offsets.json")
 local Offsets     = HttpService:JSONDecode(OffsetsJSON)
