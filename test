@@ -40,6 +40,9 @@ local Features = {
     Raid           = false,   -- Eren Raid: BigRock-anchored targeting
                               -- in phase 1, lock-on Attack_Titan in
                               -- phase 2, with Roar AOE bailout.
+    OpenPremiumChest = false, -- after a Raid mission, also click the
+                              -- Premium chest (costs keys). The Free
+                              -- chest is opened unconditionally.
 }
 
 -- Eren-Raid roar bailout. The Attack_Titan model exposes a "State"
@@ -54,6 +57,12 @@ local ROAR_HOVER_HEIGHT  = 250    -- studs above nape during a roar
 -- AutoKill loop stands down (no TPs / no slashes) and doesn't fight
 -- the player position during the refill animation.
 local RefillingNow = false
+
+-- Set true while the chest opener is mid-sequence (clicking Free,
+-- waiting for the open animation, optionally clicking Premium,
+-- finally clicking Finish). Auto Retry skips firing while this is
+-- true so the chest screen finishes draining before we retry.
+local OpeningChests = false
 
 -- Refill watchdog. AOT:R's refill prompt sometimes won't accept R
 -- (camera not facing the tank, character clipped, etc.), and the
@@ -156,24 +165,6 @@ local LifetimeStats = {
     uptime       = 0,    -- seconds with any kill mode active
 }
 local LifetimeDirty = false   -- bumped on increment, cleared on save
-
--- Uptime tracker for AutoKill (Bridger pattern).
-local killUptime = { total = 0, start = nil }
-local function uptimeSyncGeneric(u, active)
-    if active then
-        if not u.start then u.start = tick() end
-    else
-        if u.start then
-            u.total = u.total + (tick() - u.start)
-            u.start = nil
-        end
-    end
-end
-local function syncKillUptime() uptimeSyncGeneric(killUptime, Features.AutoKill) end
-local function getUptimeSeconds(u)
-    if u.start then return u.total + (tick() - u.start) end
-    return u.total
-end
 
 local VK_NAMES = {
     [0x30]="0",[0x31]="1",[0x32]="2",[0x33]="3",[0x34]="4",
@@ -390,7 +381,6 @@ local PAD = "\n" .. ZWSP
 local EMBED_OK     = 0x5F91E6   -- accent blue (default mission completed)
 local EMBED_WARN   = 0xFFC83C   -- amber (stuck mission)
 local EMBED_BAD    = 0xFF6464   -- red (refill failed / unloaded)
-local EMBED_GOOD   = 0x50DC8C   -- green (script loaded)
 
 local function sendMissionCompleted(runKills, expGain, goldGain, timeTaken)
     -- Each block is gated on its own WebhookOptions toggle, so
@@ -539,6 +529,7 @@ local function saveConfig()
             AutoRefill     = Features.AutoRefill,
             AutoBooster    = Features.AutoBooster,
             Raid           = Features.Raid,
+            OpenPremiumChest = Features.OpenPremiumChest,
         },
         webhook = {
             SendPlayerName  = WebhookOptions.SendPlayerName,
@@ -621,9 +612,7 @@ local function loadConfig()
         if type(data.features.AutoRefill)     == "boolean" then Features.AutoRefill     = data.features.AutoRefill     end
         if type(data.features.AutoBooster)    == "boolean" then Features.AutoBooster    = data.features.AutoBooster    end
         if type(data.features.Raid)           == "boolean" then Features.Raid           = data.features.Raid           end
-        if Features.AutoKill and not killUptime.start then
-            killUptime.start = tick()
-        end
+        if type(data.features.OpenPremiumChest) == "boolean" then Features.OpenPremiumChest = data.features.OpenPremiumChest end
     end
     if type(data.webhook) == "table" then
         for k, _ in pairs(WebhookOptions) do
@@ -657,6 +646,7 @@ local function resetConfigToDefaults()
     Features.AutoRefill     = false
     Features.AutoBooster    = false
     Features.Raid           = false
+    Features.OpenPremiumChest = false
 
     pcall(saveConfig)
 end
@@ -754,36 +744,6 @@ local function performAttack()
     pcall(mouse1press)
     task.wait(0.06)
     pcall(mouse1release)
-end
-
--- Returns nearest titan that still has a Humanoid, with both the
--- titan model and its nape. Returns nil, nil if none.
-local function getNearestLiveTitan()
-    local titansFolder = Workspace:FindFirstChild("Titans")
-    if not titansFolder then return nil, nil end
-    local hrp = getHRP()
-    if not hrp then return nil, nil end
-    local okPP, pPos = pcall(function() return hrp.Position end)
-    if not (okPP and pPos) then return nil, nil end
-    local bestTitan, bestNape, bestD2 = nil, nil, math.huge
-    for _, titan in ipairs(titansFolder:GetChildren()) do
-        if findHumanoid(titan) then
-            local nape = getNape(titan)
-            if nape then
-                local okN, npos = pcall(function() return nape.Position end)
-                if okN and npos then
-                    local dx = pPos.X - npos.X
-                    local dy = pPos.Y - npos.Y
-                    local dz = pPos.Z - npos.Z
-                    local d2 = dx*dx + dy*dy + dz*dz
-                    if d2 < bestD2 then
-                        bestD2 = d2; bestTitan = titan; bestNape = nape
-                    end
-                end
-            end
-        end
-    end
-    return bestTitan, bestNape
 end
 
 -- Best per-titan height signal we have without instance attributes
@@ -1067,8 +1027,37 @@ local function getRewardTimeTaken()
     return nil
 end
 
+-- Detect whether the post-Raid chest screen is actually displayed.
+-- Tricky because the screen is a CanvasGroup that hides itself by
+-- tweening GroupTransparency to 1 — children keep their layout
+-- AbsoluteSize, so the obvious "Free.AbsoluteSize > 0" check fires
+-- mid-gameplay too. We layer three signals and require all to pass:
+--   1. CanvasGroup.GroupTransparency < 0.5    (alpha-tween hide)
+--   2. chests.Visible ~= false                (explicit hide)
+--   3. Free.AbsoluteSize.X > 0                (layout signal)
+-- Any one of them being a "hidden" reading short-circuits to false.
+local function isChestScreenUp()
+    local pg     = LocalPlayer:FindFirstChild("PlayerGui")
+    local iface  = pg     and pg:FindFirstChild("Interface")
+    local chests = iface  and iface:FindFirstChild("Chests")
+    if not chests then return false end
+
+    local okT, trans = pcall(function() return chests.GroupTransparency end)
+    if okT and type(trans) == "number" and trans > 0.5 then return false end
+
+    local okV, vis = pcall(function() return chests.Visible end)
+    if okV and vis == false then return false end
+
+    local free = chests:FindFirstChild("Free")
+    if not free then return false end
+    local okSz, sz = pcall(function() return free.AbsoluteSize end)
+    if not (okSz and sz and sz.X and sz.X > 0) then return false end
+
+    return true
+end
+
 -- Forward-decl so toggle handlers can flip features through one path.
-local setHitboxOn, setAutoKillOn, setRaidOn, applyMinimizedState
+local setHitboxOn, setAutoKillOn, setRaidOn
 local CreateContent, ClearContent, UnloadScript
 
 -- ============================================================
@@ -1080,7 +1069,6 @@ GUI.NavElements      = {}
 GUI.NavClickables    = {}
 GUI.SubTabElements   = {}
 GUI.ContentElements  = {}
-GUI.LiveElements     = {}
 GUI.Clickables       = {}
 GUI.Visible          = true
 GUI.Dragging         = false
@@ -1098,13 +1086,6 @@ GUI.StatusDot        = nil
 GUI.SelectedPage     = "Main"
 GUI.SubTab           = "Automation"
 GUI.ListeningForKey  = false
-GUI.Minimized        = false
-GUI.MiniElements     = {}
-GUI.MiniLiveElements = {}
-GUI.MiniTitansVal    = nil
-GUI.MiniSizeVal      = nil
-GUI.MiniKilledVal    = nil
-GUI.MiniUptimeVal    = nil
 GUI.WasHitboxKeyDown   = false
 GUI.WasAutoKillKeyDown = false
 GUI.WasRaidKeyDown     = false
@@ -1355,7 +1336,6 @@ ClearContent = function()
         pcall(function() el:Remove() end)
     end
     GUI.ContentElements = {}
-    GUI.LiveElements    = {}
     GUI.Clickables      = {}
     GUI.LifeKillsVal    = nil
     GUI.LifeExpVal      = nil
@@ -1472,7 +1452,6 @@ local function DrawStatRow(cardX, cardW, curY, label, initialValue, zbase)
     local estW = #valStr * 8
     val.Position = Vector2.new(rightEdge - estW, curY + 1)
     table.insert(GUI.ContentElements, val)
-    table.insert(GUI.LiveElements, val)
     return val, rightEdge
 end
 
@@ -1976,8 +1955,7 @@ local function PageAutomation(zb, cardX, cardW)
     local contentTopY = contentTopFor("Main")
     local leftX, rightX, colW = splitCols(cardX, cardW)
 
-    -- LEFT: Features (5 toggles — Hitbox Expander moved to right card,
-    -- Stall removed entirely).
+    -- LEFT: Features (5 toggles).
     local featuresH = 52 + 5 * Config.RowHeight + 14
     local fY = DrawCard(leftX, contentTopY, colW, featuresH, "Features", zb)
 
@@ -2011,9 +1989,7 @@ local function PageAutomation(zb, cardX, cardW)
             CreateContent()
         end)
 
-    -- RIGHT: Hitbox Expander (toggle + bind pill + Size slider). The
-    -- Session/stats panel that used to live here moved to the
-    -- Webhook tab — hitboxes are AutoKill territory, stats aren't.
+    -- RIGHT TOP: Hitbox Expander (toggle + bind pill + Size slider).
     local sliderX  = rightX + Config.CardPad
     local sliderW  = colW - 2 * Config.CardPad
     local hbCardH  = 52 + Config.RowHeight + 14 + 56
@@ -2225,7 +2201,7 @@ local function PageRaid(zb, cardX, cardW)
     local contentTopY = Config.WinY + Config.HeaderH + Config.TabStripH + Config.ContentPad
     local leftX, _, colW = splitCols(cardX, cardW)
 
-    local toggleH = 52 + 1 * Config.RowHeight + 14
+    local toggleH = 52 + 2 * Config.RowHeight + 14
     local fY = DrawCard(leftX, contentTopY, colW, toggleH, "Eren Raid", zb)
 
     DrawCardToggleRow(leftX, colW, fY, "Raid",
@@ -2233,6 +2209,14 @@ local function PageRaid(zb, cardX, cardW)
             setRaidOn(not Features.Raid)
         end)
     drawHotkeyPill(leftX, colW, fY, RaidKey, "raid", zb)
+
+    -- Premium chest toggle. Free chest is opened unconditionally at
+    -- end-of-mission; Premium costs keys, so it's opt-in.
+    DrawCardToggleRow(leftX, colW, fY + Config.RowHeight, "Open Premium Chest?",
+        Features.OpenPremiumChest, Colors.AccentRed, zb, function()
+            Features.OpenPremiumChest = not Features.OpenPremiumChest
+            CreateContent()
+        end)
 end
 
 -- Webhook page — Session totals on the left, content toggles on
@@ -2407,176 +2391,6 @@ local function UpdateStatsLive()
     end)
 end
 
--- ============================================================
--- MINI STATS PANEL — shown when a farm is on
--- ============================================================
-
-local function getViewportSize()
-    local cam = Workspace and Workspace.CurrentCamera
-    if cam then
-        local ok, vp = pcall(function() return cam.ViewportSize end)
-        if ok and vp and vp.X and vp.X > 0 then return vp.X, vp.Y end
-    end
-    return 1920, 1080
-end
-
-local MINI_W = 280
-local MINI_ROW_H = 22
-local MINI_HEADER_H = 28
-
-local function clearMiniPanel()
-    for _, el in ipairs(GUI.MiniElements) do
-        pcall(function() el:Remove() end)
-    end
-    GUI.MiniElements = {}
-    GUI.MiniLiveElements = {}
-    GUI.MiniTitansVal = nil
-    GUI.MiniSizeVal   = nil
-    GUI.MiniKilledVal = nil
-    GUI.MiniUptimeVal = nil
-end
-
-local function buildMiniPanel()
-    clearMiniPanel()
-    local rows = {}
-    if Features.HitboxExpander then
-        table.insert(rows, { label = "Titans",      key = "titans" })
-        table.insert(rows, { label = "Hitbox Size", key = "size"   })
-    end
-    if Features.AutoKill then
-        if not Features.HitboxExpander then
-            table.insert(rows, { label = "Titans", key = "titans" })
-        end
-        table.insert(rows, { label = "Killed", key = "killed" })
-        table.insert(rows, { label = "Uptime", key = "uptime" })
-    end
-    if #rows == 0 then return end
-
-    local vpW, _ = getViewportSize()
-    local noteH = 18
-    local h = MINI_HEADER_H + #rows * MINI_ROW_H + noteH + 10
-    local x = math.floor((vpW - MINI_W) / 2)
-    local y = 20
-    local z = 80
-
-    local bg = Drawing.new("Square")
-    bg.Position = Vector2.new(x, y); bg.Size = Vector2.new(MINI_W, h)
-    bg.Color = Colors.HeaderInfoBg; bg.Filled = true; bg.Corner = 6
-    bg.Transparency = 0.55
-    bg.Visible = true; bg.ZIndex = z
-    table.insert(GUI.MiniElements, bg)
-
-    local border = Drawing.new("Square")
-    border.Position = Vector2.new(x, y); border.Size = Vector2.new(MINI_W, h)
-    border.Color = Colors.AccentRed; border.Filled = false
-    border.Thickness = 1; border.Corner = 6
-    border.Visible = true; border.ZIndex = z + 1
-    table.insert(GUI.MiniElements, border)
-
-    local title = Drawing.new("Text")
-    title.Position = Vector2.new(x + 12, y + 8)
-    title.Text = "Stats"
-    title.Color = Colors.AccentRed
-    title.Size = 14; title.Font = Drawing.Fonts.SystemBold
-    title.Center = false; title.Outline = false
-    title.Visible = true; title.ZIndex = z + 2
-    table.insert(GUI.MiniElements, title)
-
-    local underline = Drawing.new("Line")
-    underline.From = Vector2.new(x + 1, y + MINI_HEADER_H)
-    underline.To   = Vector2.new(x + MINI_W - 1, y + MINI_HEADER_H)
-    underline.Color = Colors.AccentRed; underline.Thickness = 1
-    underline.Visible = true; underline.ZIndex = z + 2
-    table.insert(GUI.MiniElements, underline)
-
-    local rightEdge = x + MINI_W - 14
-    for i, row in ipairs(rows) do
-        local rowY = y + MINI_HEADER_H + 6 + (i - 1) * MINI_ROW_H
-
-        local lbl = Drawing.new("Text")
-        lbl.Position = Vector2.new(x + 14, rowY)
-        lbl.Text = row.label; lbl.Color = Colors.TextMuted
-        lbl.Size = 13; lbl.Font = Drawing.Fonts.System
-        lbl.Center = false; lbl.Outline = false
-        lbl.Visible = true; lbl.ZIndex = z + 2
-        table.insert(GUI.MiniElements, lbl)
-
-        local valStr = "0"
-        local val = Drawing.new("Text")
-        val.Text = valStr
-        val.Color = Colors.TextPrimary
-        val.Size = 14; val.Font = Drawing.Fonts.SystemBold
-        val.Center = false; val.Outline = false
-        val.Visible = true; val.ZIndex = z + 2
-        local estW = #valStr * 8
-        val.Position = Vector2.new(rightEdge - estW, rowY - 1)
-        table.insert(GUI.MiniElements, val)
-        table.insert(GUI.MiniLiveElements, val)
-
-        if     row.key == "titans" then GUI.MiniTitansVal = val
-        elseif row.key == "size"   then GUI.MiniSizeVal   = val
-        elseif row.key == "killed" then GUI.MiniKilledVal = val
-        elseif row.key == "uptime" then GUI.MiniUptimeVal = val
-        end
-    end
-
-    -- Footer: "[KEY] to Stop". Both binds shown if both farms are on.
-    local hintParts = {}
-    if Features.HitboxExpander then
-        table.insert(hintParts, "[" .. getKeyName(HitboxKey) .. "] Hitbox")
-    end
-    if Features.AutoKill then
-        table.insert(hintParts, "[" .. getKeyName(AutoKillKey) .. "] Kill")
-    end
-    local hintTxt = table.concat(hintParts, "  ")
-
-    local noteY = y + MINI_HEADER_H + 6 + #rows * MINI_ROW_H + 4
-    local note = Drawing.new("Text")
-    note.Position = Vector2.new(x + MINI_W / 2, noteY)
-    note.Text = hintTxt
-    note.Color = Colors.TextMuted
-    note.Size = 12; note.Font = Drawing.Fonts.System
-    note.Center = true; note.Outline = false
-    note.Visible = true; note.ZIndex = z + 2
-    table.insert(GUI.MiniElements, note)
-end
-
-local function setMiniVal(el, txt)
-    if not el then return end
-    pcall(function()
-        el.Text = txt
-        local vpW, _ = getViewportSize()
-        local x = math.floor((vpW - MINI_W) / 2)
-        local rightEdge = x + MINI_W - 14
-        el.Position = Vector2.new(rightEdge - #txt * 8, el.Position.Y)
-    end)
-end
-
-local function updateMiniStatsLive()
-    if not GUI.Minimized then return end
-    if GUI.MiniTitansVal then setMiniVal(GUI.MiniTitansVal, tostring(getTitanCount())) end
-    if GUI.MiniSizeVal   then setMiniVal(GUI.MiniSizeVal,   tostring(HitboxSize)) end
-    if GUI.MiniKilledVal then setMiniVal(GUI.MiniKilledVal, tostring(Stats.TitansKilled)) end
-    if GUI.MiniUptimeVal then setMiniVal(GUI.MiniUptimeVal, FormatUptime(getUptimeSeconds(killUptime))) end
-end
-
-applyMinimizedState = function()
-    if GUI.Minimized then
-        for _, el in ipairs(GUI.Elements)        do pcall(function() el.Visible = false end) end
-        for _, el in ipairs(GUI.NavElements)     do pcall(function() el.Visible = false end) end
-        for _, el in ipairs(GUI.SubTabElements)  do pcall(function() el.Visible = false end) end
-        ClearContent()
-        buildMiniPanel()
-    else
-        clearMiniPanel()
-        if GUI.Visible then
-            for _, el in ipairs(GUI.Elements)    do pcall(function() el.Visible = true end) end
-            for _, el in ipairs(GUI.NavElements) do pcall(function() el.Visible = true end) end
-            CreateContent()
-        end
-    end
-end
-
 setHitboxOn = function(on)
     if Features.HitboxExpander == on then return end
     Features.HitboxExpander = on
@@ -2587,8 +2401,13 @@ end
 setAutoKillOn = function(on)
     if Features.AutoKill == on then return end
     Features.AutoKill = on
-    syncKillUptime()
-    if on then lastKillAt = tick() end   -- arm stuck-mission watchdog
+    if on then
+        lastKillAt = tick()              -- arm stuck-mission watchdog
+        -- Mutex with Raid: only one farm engine runs at a time.
+        -- Without this the user toggles one off and the engine
+        -- keeps going on the other, making it look stuck.
+        if Features.Raid then setRaidOn(false) end
+    end
     saveAutoKillState()                  -- persist on/off across reloads
     if GUI.Visible then CreateContent() end
 end
@@ -2601,7 +2420,10 @@ end
 setRaidOn = function(on)
     if Features.Raid == on then return end
     Features.Raid = on
-    if on then lastKillAt = tick() end   -- arm stuck-mission watchdog
+    if on then
+        lastKillAt = tick()              -- arm stuck-mission watchdog
+        if Features.AutoKill then setAutoKillOn(false) end
+    end
     if GUI.Visible then CreateContent() end
 end
 
@@ -2648,7 +2470,7 @@ task.spawn(function()
         -- overhead, halving the tick rate roughly halves the constant
         -- CPU cost without making the snake noticeably less smooth.
         task.wait(0.05)
-        if GUI.Visible and not GUI.Minimized and type(rainbowSegs) == "table" and #rainbowSegs > 0 then
+        if GUI.Visible and type(rainbowSegs) == "table" and #rainbowSegs > 0 then
             local t = tick()
             local headPos = (t * SNAKE_SPEED) % 1
             for _, seg in ipairs(rainbowSegs) do
@@ -2860,7 +2682,9 @@ UnloadScript = function()
     Features.AutoRefill     = false
     Features.AutoBooster    = false
     Features.Raid           = false
+    Features.OpenPremiumChest = false
     RefillingNow            = false
+    OpeningChests           = false
     pcall(restoreTitans)
     pcall(restoreAutoKillTitans)
     for _, el in ipairs(GUI.Elements)    do pcall(function() el:Remove() end) end
@@ -2869,7 +2693,6 @@ UnloadScript = function()
     GUI.NavElements   = {}
     GUI.NavClickables = {}
     ClearContent()
-    clearMiniPanel()
     pcall(saveLifetimeStats)   -- flush last few seconds of progress
     sendScriptUnloaded()
     notify("AOT:R unloaded", "AOT:R", 3)
@@ -2942,9 +2765,8 @@ task.spawn(function()
     end
 
     while GUI.Running do
-        -- The kill engine runs whenever AutoKill OR Raid is on. They
-        -- share the same slam pattern + tunables; Raid only swaps
-        -- targeting / adds the Roar bailout.
+        -- Auto Kill engine runs when AutoKill or Raid is on. Loop
+        -- Kill is its own loop now — separate task below.
         if Features.AutoKill or Features.Raid then
             -- Auto Refill is doing its TP → R → 5s wait. Stand down
             -- entirely (no TPs, no slashes) but DON'T restore titan
@@ -3348,6 +3170,115 @@ task.spawn(function()
     end
 end)
 
+-- Auto Chest Opener — at the end of a Raid mission AOT:R surfaces a
+-- chest screen at PlayerGui.Interface.Chests with Free / Premium
+-- TextButtons and a Finish button. Mouse clicks don't land here
+-- (the cursor doesn't make it to the buttons), so we drive Roblox's
+-- GUI navigation: \ to engage focus + Enter to activate.
+--
+-- Sequence (Premium ON):
+--   \ Enter   → opens Free, wait 6s
+--   \ Enter   → opens Premium (now first focusable), wait 6s
+--   \ Enter   → activates Finish
+--
+-- Sequence (Premium OFF):
+--   \ Enter   → opens Free, wait 6s
+--   \ S Enter → \ lands on Premium, S steps down to Finish, Enter
+local CHEST_OPEN_DELAY = 6.5    -- seconds the open animation eats
+
+task.spawn(function()
+    while tick() - SCRIPT_LOAD_AT < READY_DELAY do task.wait(0.5) end
+
+    local VK_BACKSLASH_C = 0xDC
+    local VK_ENTER_C     = 0x0D
+    local VK_S_C         = 0x53
+    local function tap(vk)
+        pcall(keypress, vk)
+        task.wait(0.08)
+        pcall(keyrelease, vk)
+    end
+
+    -- State-based gate. The chest screen only appears after Eren
+    -- (Attack_Titan) is killed in phase 2. We require:
+    --   1. Attack_Titan was seen alive at some point this session
+    --      (lastLiveAttackTitanAt > 0)
+    --   2. No live Attack_Titan for 6+ seconds (he's dead/gone)
+    -- Without (1), a false-positive isChestScreenUp() during phase 1
+    -- (before Attack_Titan even spawns) would still fire. The two
+    -- gates together kill that path.
+    local lastLiveAttackTitanAt = 0
+    local CHEST_TITAN_GAP = 6
+
+    local function attackTitanAlive()
+        local titans = Workspace:FindFirstChild("Titans")
+        if not titans then return false end
+        local eren = titans:FindFirstChild("Attack_Titan")
+        if not eren then return false end
+        return findHumanoid(eren) ~= nil
+    end
+
+    -- Wait helper that aborts early when the rewards screen with
+    -- TIME TAKEN comes up. That's our "chest stage finished" signal
+    -- — once it's visible, Auto Retry should take over and we don't
+    -- want to keep firing keypresses into the next screen.
+    local function awaitOrAbort(seconds)
+        local endAt = tick() + seconds
+        while tick() < endAt do
+            if getRewardTimeTaken() ~= nil then return false end
+            task.wait(0.15)
+        end
+        return true
+    end
+
+    while GUI.Running do
+        if attackTitanAlive() then lastLiveAttackTitanAt = tick() end
+
+        if Features.Raid and not OpeningChests
+           and lastLiveAttackTitanAt > 0
+           and (tick() - lastLiveAttackTitanAt) > CHEST_TITAN_GAP
+           and isChestScreenUp()
+           and getRewardTimeTaken() == nil then
+            OpeningChests = true
+
+            repeat
+                -- Free chest — always.
+                tap(VK_BACKSLASH_C)
+                task.wait(0.3)
+                tap(VK_ENTER_C)
+                if not awaitOrAbort(CHEST_OPEN_DELAY) then break end
+
+                if Features.OpenPremiumChest then
+                    -- Premium chest. \ now lands on Premium since
+                    -- Free is already opened.
+                    tap(VK_BACKSLASH_C)
+                    task.wait(0.3)
+                    tap(VK_ENTER_C)
+                    if not awaitOrAbort(CHEST_OPEN_DELAY) then break end
+
+                    -- Finish — \ lands on it (last button left).
+                    tap(VK_BACKSLASH_C)
+                    task.wait(0.3)
+                    tap(VK_ENTER_C)
+                else
+                    -- Skip Premium straight to Finish: \ focuses
+                    -- Premium, S steps focus down to Finish, Enter
+                    -- activates.
+                    tap(VK_BACKSLASH_C)
+                    task.wait(0.3)
+                    tap(VK_S_C)
+                    task.wait(0.3)
+                    tap(VK_ENTER_C)
+                end
+
+                awaitOrAbort(0.5)
+            until true
+
+            OpeningChests = false
+        end
+        task.wait(0.5)
+    end
+end)
+
 -- Auto Retry — when "Mission Completed" comes up, drive Roblox's
 -- built-in GUI navigation to focus and activate the RETRY button.
 --
@@ -3430,7 +3361,15 @@ task.spawn(function()
             local stuckMission = (Features.AutoKill or Features.Raid)
                               and (tick() - lastKillAt) > 180
                               and getTitanCount() > 0
-            if (cleanEnd or stuckMission)
+            -- If the rewards screen with TIME TAKEN is up, fire
+            -- retry immediately — that signal trumps any in-flight
+            -- chest sequence (it means the chest stage is done and
+            -- we're now on the post-mission screen). The chest gate
+            -- still applies to the stuckMission path because there's
+            -- no rewards-screen signal there.
+            local fireOk = cleanEnd
+                        or (stuckMission and not (OpeningChests or isChestScreenUp()))
+            if fireOk
                and (not firedThisSession)
                and (tick() - lastFire > 4.0)
                and retryButtonExists() then
@@ -3571,13 +3510,7 @@ task.spawn(function()
             GUI.StatusDot.Color = active and Colors.StatusOn or Colors.StatusOff
             GUI.StatusText.Text = active and "Active" or "Idle"
         end)
-        if GUI.Visible then
-            if GUI.Minimized then
-                updateMiniStatsLive()
-            else
-                UpdateStatsLive()
-            end
-        end
+        if GUI.Visible then UpdateStatsLive() end
     end
 end)
 
@@ -3628,11 +3561,11 @@ local function InputLoop()
                     GUI.EditingSlider.onChange(num)
                 end
                 GUI.EditingSlider = nil; GUI.SliderBuffer = ""; GUI.SliderKeyState = {}
-                if GUI.Visible and not GUI.Minimized then CreateContent() end
+                if GUI.Visible then CreateContent() end
             end
             if GUI.EditingSlider and sliderRising(0x1B) then
                 GUI.EditingSlider = nil; GUI.SliderBuffer = ""; GUI.SliderKeyState = {}
-                if GUI.Visible and not GUI.Minimized then CreateContent() end
+                if GUI.Visible then CreateContent() end
             end
             if valChanged and GUI.EditingSlider and GUI.EditingSlider.valTxt then
                 pcall(function()
@@ -3675,7 +3608,7 @@ local function InputLoop()
                         GUI.WasRaidKeyDown = true
                     end
                     ListeningForBind = nil
-                    if GUI.Visible and not GUI.Minimized then CreateContent() end
+                    if GUI.Visible then CreateContent() end
                     task.wait(0.3)
                     break
                 end
@@ -3756,10 +3689,11 @@ local function InputLoop()
                         pcall(function() el.Visible = false end)
                     end
                     ClearContent()
-                    clearMiniPanel()
                     clearTooltip()
                 else
-                    applyMinimizedState()
+                    for _, el in ipairs(GUI.Elements)    do pcall(function() el.Visible = true end) end
+                    for _, el in ipairs(GUI.NavElements) do pcall(function() el.Visible = true end) end
+                    CreateContent()
                 end
             end
             GUI.WasToggleDown = toggleDown
