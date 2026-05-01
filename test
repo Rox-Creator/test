@@ -34,7 +34,7 @@ local HitboxSize    = 150      -- nape hitbox cube size (studs)
 local DropHeight    = 82      -- studs above nape we snap each cycle
 local DropDwell     = 0.15    -- max free-fall seconds before TP'ing back up
 local FloorBuffer   = 60      -- exit dwell once player crosses nape.Y + this
-local AnchorEvery   = 6       -- cycles between INSTANT velocity resets
+local AnchorEvery   = 8       -- cycles between INSTANT velocity resets
 local KillCooldown  = 0.10    -- seconds between slashes
 
 -- Boot delay — same 8s warmup AOTR.lua uses, so the player isn't TPed
