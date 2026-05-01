@@ -78,6 +78,10 @@ local lastKillAt          = tick()
 local refillFailures      = 0
 local refillCooldownUntil = 0
 local OriginalSizes       = {}
+-- Auto Booster opts out (no Space spam) until tick() reaches this.
+-- Used by the blade-stuck watchdog: pressing R while dashing eats
+-- the swap, so we pause the booster for ~1s around the R tap.
+local BoostPauseUntil     = 0
 
 -- ============================================================
 -- HELPERS
@@ -362,7 +366,14 @@ task.spawn(function()
                     cycleCount = 0
                 end
 
-                -- Blade-stuck watchdog
+                -- Blade-stuck watchdog. Only fires R if BOTH:
+                --   1. The HUD blade-set count hasn't ticked down
+                --   2. No titan has died
+                -- ...for BladeStuckTimeout seconds. Either signal is
+                -- proof the kill engine is working — high-durability
+                -- blades can take a while to register a count drop
+                -- but kills still happen, and we shouldn't penalize
+                -- that with a forced blade swap.
                 do
                     local sets = getBladeSets()
                     if sets then
@@ -371,8 +382,18 @@ task.spawn(function()
                         end
                         prevBladeCount = sets
                     end
-                    if tick() - lastBladeDecrement > BladeStuckTimeout then
-                        tap(0x52)   -- R
+                    if tick() - lastBladeDecrement > BladeStuckTimeout
+                       and tick() - lastKillAt        > BladeStuckTimeout then
+                        -- Pause Auto Booster around the R tap. A swap
+                        -- pressed mid-dash gets eaten and we'd waste
+                        -- another full BladeStuckTimeout window before
+                        -- the watchdog tries again.
+                        BoostPauseUntil = tick() + 1.2
+                        task.wait(0.2)              -- let booster release Space
+                        pcall(keypress,   0x52)
+                        task.wait(0.08)
+                        pcall(keyrelease, 0x52)
+                        task.wait(0.5)              -- let the swap animation finish
                         activeTitan, activeNape = nil, nil
                         cycleCount         = 0
                         lastBladeDecrement = tick()
@@ -599,7 +620,7 @@ end)
 task.spawn(function()
     while tick() - SCRIPT_LOAD_AT < ReadyDelay do task.wait(0.5) end
     while Running do
-        if RefillingNow then
+        if RefillingNow or tick() < BoostPauseUntil then
             task.wait(0.2)
         else
             local onTitan = false
@@ -666,6 +687,15 @@ task.spawn(function()
             firedThisSession = true
             lastFire = tick()
 
+            -- Give the rewards screen a moment to fully settle before
+            -- driving GUI nav. Pressing too soon sometimes lands on
+            -- the wrong button or gets eaten by the screen's intro
+            -- animation. Poll-loop instead of a single task.wait(3) —
+            -- some executor builds clamp task.wait to short durations
+            -- and the 3s gap silently collapses to ~30ms.
+            local retryWaitEnd = tick() + 3
+            while tick() < retryWaitEnd do task.wait(0.2) end
+
             -- Re-inject after sub-place teleport.
             pcall(function()
                 if queue_on_teleport then
@@ -679,13 +709,14 @@ task.spawn(function()
                 end
             end)
 
-            -- \ → D → D → Enter
+            -- \ → D → D → Enter (slower gaps so each press has room
+            -- to register before the next).
             tap(0xDC)
-            task.wait(0.3)
+            task.wait(0.5)
             tap(0x44)
-            task.wait(0.3)
+            task.wait(0.5)
             tap(0x44)
-            task.wait(0.3)
+            task.wait(0.5)
             tap(0x0D)
         end
         task.wait(0.5)
