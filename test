@@ -30,11 +30,11 @@ local Offsets     = HttpService:JSONDecode(OffsetsJSON)
 -- ============================================================
 
 -- Auto Kill slam pattern (matches the Tuning sliders from AOTR.lua)
-local HitboxSize    = 150     -- nape hitbox cube size (studs)
+local HitboxSize    = 150      -- nape hitbox cube size (studs)
 local DropHeight    = 82      -- studs above nape we snap each cycle
 local DropDwell     = 0.15    -- max free-fall seconds before TP'ing back up
 local FloorBuffer   = 60      -- exit dwell once player crosses nape.Y + this
-local AnchorEvery   = 8       -- cycles between INSTANT velocity resets
+local AnchorEvery   = 6       -- cycles between INSTANT velocity resets
 local KillCooldown  = 0.10    -- seconds between slashes
 
 -- Boot delay — same 8s warmup AOTR.lua uses, so the player isn't TPed
@@ -608,7 +608,7 @@ task.spawn(function()
                 end
             end
         end
-        task.wait()
+        task.wait(0.9)
     end
 end)
 
@@ -674,7 +674,17 @@ task.spawn(function()
 
     while Running do
         local rewardsShowing = getRewardTimeTaken() ~= nil
-        if not rewardsShowing then firedThisSession = false end
+        if not rewardsShowing then
+            firedThisSession = false
+        elseif firedThisSession and (tick() - lastFire) > 20 then
+            -- Rewards screen is still up 20s after we fired the
+            -- retry sequence, which means the keys didn't actually
+            -- click Retry (focus landed somewhere else, screen
+            -- animation ate them, etc.). Re-arm so the loop fires
+            -- again. Keeps re-trying until we actually leave the
+            -- screen.
+            firedThisSession = false
+        end
 
         local stuckMission = (tick() - lastKillAt) > StuckMissionAfter
                           and getTitanCount() > 0
