@@ -62,11 +62,6 @@ local StuckMissionAfter = 180   -- seconds — force retry if no kill in this lo
 -- last set actually gets used first.
 local BladesZeroDelay = 8
 
--- Auto Skills — alternates 1 and 2 key presses for SkillsActiveTime
--- seconds, then waits SkillsRestTime seconds, repeats forever.
-local SkillsActiveTime = 2     -- seconds spamming 1 / 2
-local SkillsRestTime   = 5     -- seconds idle before next burst
-
 -- Re-injection path. Set this to wherever you save THIS file. After
 -- a sub-place retry, queue_on_teleport reloads from disk so the
 -- script keeps running on the new map.
@@ -613,37 +608,7 @@ task.spawn(function()
                 end
             end
         end
-        task.wait(0.9)
-    end
-end)
-
--- ============================================================
--- AUTO SKILLS — burst-spam keys 1 and 2 for SkillsActiveTime, then
--- idle for SkillsRestTime, repeat. Pauses during refill so we don't
--- fire skills while parked on the gas tank.
--- ============================================================
-task.spawn(function()
-    while tick() - SCRIPT_LOAD_AT < ReadyDelay do task.wait(0.5) end
-    while Running do
-        if RefillingNow then
-            task.wait(0.2)
-        else
-            -- Active burst — alternate 1 / 2 for SkillsActiveTime seconds.
-            local burstEnd = tick() + SkillsActiveTime
-            while Running and tick() < burstEnd and not RefillingNow do
-                pcall(keypress,   0x31)   -- 1
-                task.wait(0.04)
-                pcall(keyrelease, 0x31)
-                task.wait(0.02)
-                pcall(keypress,   0x32)   -- 2
-                task.wait(0.04)
-                pcall(keyrelease, 0x32)
-                task.wait(0.02)
-            end
-            -- Idle window
-            local restEnd = tick() + SkillsRestTime
-            while Running and tick() < restEnd do task.wait(0.2) end
-        end
+        task.wait(0.2)
     end
 end)
 
